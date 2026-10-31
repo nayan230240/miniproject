@@ -1,0 +1,18 @@
+/* Simple layout for the placeholder home page. */
+
+.page {
+  max-width: 40rem;
+  margin: 4rem auto;
+  padding: 0 1.5rem;
+  text-align: center;
+}
+
+.status {
+  margin-top: 1.5rem;
+  font-weight: 600;
+}
+
+.hint {
+  color: #555;
+  font-size: 0.95rem;
+}

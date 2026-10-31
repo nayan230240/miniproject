@@ -1,0 +1,80 @@
+# Configo local stack.
+# Run everything with: docker compose up --build
+# Services:
+#   - backend  = FastAPI API (port 8000)
+#   - frontend = React + Vite (port 5173)
+#   - fleet-1..5 = fake machines that will later report configs
+
+services:
+  backend:
+    build: ./backend
+    container_name: configo-backend
+    ports:
+      - "8000:8000"
+    # SQLite file lives inside this named volume so it survives restarts.
+    environment:
+      DATABASE_URL: sqlite:////app/data/configo.db
+    volumes:
+      - configo-db:/app/data
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health')"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  frontend:
+    build: ./frontend
+    container_name: configo-frontend
+    ports:
+      - "5173:5173"
+    depends_on:
+      - backend
+    environment:
+      # Vite reads this at start time. The browser still talks to localhost:8000
+      # because the UI runs in your browser, not inside the container.
+      VITE_API_URL: http://localhost:8000
+
+  # Five simulated fleet members. Same image, different names.
+  # Later these will send their config to the backend.
+  fleet-1:
+    build: ./fleet
+    container_name: configo-fleet-1
+    environment:
+      FLEET_NAME: fleet-1
+    depends_on:
+      - backend
+
+  fleet-2:
+    build: ./fleet
+    container_name: configo-fleet-2
+    environment:
+      FLEET_NAME: fleet-2
+    depends_on:
+      - backend
+
+  fleet-3:
+    build: ./fleet
+    container_name: configo-fleet-3
+    environment:
+      FLEET_NAME: fleet-3
+    depends_on:
+      - backend
+
+  fleet-4:
+    build: ./fleet
+    container_name: configo-fleet-4
+    environment:
+      FLEET_NAME: fleet-4
+    depends_on:
+      - backend
+
+  fleet-5:
+    build: ./fleet
+    container_name: configo-fleet-5
+    environment:
+      FLEET_NAME: fleet-5
+    depends_on:
+      - backend
+
+volumes:
+  configo-db:

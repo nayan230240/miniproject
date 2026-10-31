@@ -1,0 +1,15 @@
+# Python leftovers from running the backend locally
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.db
+
+# Node leftovers from running the frontend locally
+node_modules/
+dist/
+
+# Editor / OS noise
+.DS_Store
+.idea/
+.vscode/
