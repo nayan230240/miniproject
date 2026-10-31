@@ -3,7 +3,19 @@
 # Services:
 #   - backend  = FastAPI API (port 8000)
 #   - frontend = React + Vite (port 5173)
-#   - fleet-1..5 = fake machines that will later report configs
+#   - fleet-1..5 = simulated servers (GET /config). 1-3 identical, 4-5 drifted
+
+# Shared "golden" config for identical hosts (Compose extension field, not a service).
+# YAML anchor (&fleet-baseline) is copied into each fleet container's environment.
+# fleet-4 / fleet-5 copy it too, then override one or two keys (drift).
+x-fleet-baseline: &fleet-baseline
+  OS_VERSION: "Ubuntu 22.04.5 LTS"
+  KERNEL_VERSION: "5.15.0-119-generic"
+  INSTALLED_PACKAGES: "nginx=1.18.0,openssl=3.0.2,python3=3.10.12,curl=7.81.0"
+  OPEN_PORTS: "22,80,443"
+  # Named SIMULATED_ENV_VARS so we do not confuse it with Docker's own env.
+  SIMULATED_ENV_VARS: "APP_ENV=production,LOG_LEVEL=info,TZ=UTC"
+  SSH_SETTINGS: "PermitRootLogin=no,PasswordAuthentication=no,Port=22"
 
 services:
   backend:
@@ -14,6 +26,15 @@ services:
     # SQLite file lives inside this named volume so it survives restarts.
     environment:
       DATABASE_URL: sqlite:////app/data/configo.db
+      # Docker DNS names: backend talks to fleet containers on the compose network.
+      FLEET_URLS: http://fleet-1:8000,http://fleet-2:8000,http://fleet-3:8000,http://fleet-4:8000,http://fleet-5:8000
+      POLL_INTERVAL_SECONDS: "30"
+      # LLM key is read from your shell / a local .env file. Never commit a real key.
+      # ${LLM_API_KEY:-} means "use the host env, or empty if unset" (fallback kicks in).
+      LLM_API_KEY: ${LLM_API_KEY:-}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      LLM_API_URL: ${LLM_API_URL:-https://api.openai.com/v1/chat/completions}
+      LLM_MODEL: ${LLM_MODEL:-gpt-4o-mini}
     volumes:
       - configo-db:/app/data
     healthcheck:
@@ -34,12 +55,13 @@ services:
       # because the UI runs in your browser, not inside the container.
       VITE_API_URL: http://localhost:8000
 
-  # Five simulated fleet members. Same image, different names.
-  # Later these will send their config to the backend.
   fleet-1:
     build: ./fleet
     container_name: configo-fleet-1
+    ports:
+      - "8001:8000"
     environment:
+      <<: *fleet-baseline
       FLEET_NAME: fleet-1
     depends_on:
       - backend
@@ -47,7 +69,10 @@ services:
   fleet-2:
     build: ./fleet
     container_name: configo-fleet-2
+    ports:
+      - "8002:8000"
     environment:
+      <<: *fleet-baseline
       FLEET_NAME: fleet-2
     depends_on:
       - backend
@@ -55,24 +80,38 @@ services:
   fleet-3:
     build: ./fleet
     container_name: configo-fleet-3
+    ports:
+      - "8003:8000"
     environment:
+      <<: *fleet-baseline
       FLEET_NAME: fleet-3
     depends_on:
       - backend
 
+  # Drift example 1: same host, older openssl package.
   fleet-4:
     build: ./fleet
     container_name: configo-fleet-4
+    ports:
+      - "8004:8000"
     environment:
+      <<: *fleet-baseline
       FLEET_NAME: fleet-4
+      INSTALLED_PACKAGES: "nginx=1.18.0,openssl=3.0.0,python3=3.10.12,curl=7.81.0"
     depends_on:
       - backend
 
+  # Drift example 2: extra open port + weaker SSH setting.
   fleet-5:
     build: ./fleet
     container_name: configo-fleet-5
+    ports:
+      - "8005:8000"
     environment:
+      <<: *fleet-baseline
       FLEET_NAME: fleet-5
+      OPEN_PORTS: "22,80,443,8080"
+      SSH_SETTINGS: "PermitRootLogin=yes,PasswordAuthentication=no,Port=22"
     depends_on:
       - backend
 

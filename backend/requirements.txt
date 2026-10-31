@@ -4,3 +4,7 @@ fastapi==0.115.6
 uvicorn[standard]==0.32.1
 # Database toolkit (we use SQLite with it)
 sqlalchemy==2.0.36
+# HTTP client used by the poller to call each fleet /config
+httpx==0.27.2
+# Clustering library used by GET /drift (DBSCAN)
+scikit-learn==1.5.2

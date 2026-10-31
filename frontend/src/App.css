@@ -1,18 +1,305 @@
-/* Simple layout for the placeholder home page. */
+/* DriftWise layout. Components stay dumb; this file owns the look. */
 
-.page {
-  max-width: 40rem;
-  margin: 4rem auto;
-  padding: 0 1.5rem;
-  text-align: center;
+.shell {
+  max-width: 1200px;
+  margin: 0 auto;
+  padding: 2rem 1.5rem 3rem;
 }
 
-.status {
-  margin-top: 1.5rem;
+.header {
+  display: flex;
+  justify-content: space-between;
+  gap: 1.5rem;
+  align-items: flex-end;
+  margin-bottom: 1.75rem;
+}
+
+.eyebrow {
+  margin: 0;
+  letter-spacing: 0.28em;
+  text-transform: uppercase;
+  font-size: 0.72rem;
+  color: var(--violet);
+}
+
+.header h1 {
+  margin: 0.15rem 0 0.2rem;
+  font-size: 2.4rem;
+  letter-spacing: -0.03em;
+}
+
+.subtitle,
+.refresh-stamp,
+.server-url,
+.empty,
+.stat-label,
+.diff-label,
+.source-chip {
+  color: var(--muted);
+}
+
+.subtitle {
+  margin: 0;
+}
+
+.header-meta {
+  text-align: right;
+}
+
+.header-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+  justify-content: flex-end;
+}
+
+.refresh-stamp {
+  margin: 0 0 0.6rem;
+  font-size: 0.85rem;
+}
+
+.ghost-btn {
+  background: transparent;
+  color: var(--cyan);
+  border: 1px solid var(--cyan);
+  border-radius: 999px;
+  padding: 0.45rem 0.95rem;
+  cursor: pointer;
+}
+
+.ghost-btn:disabled,
+.primary-btn:disabled {
+  opacity: 0.5;
+  cursor: wait;
+}
+
+.primary-btn {
+  background: var(--violet);
+  color: #f5f0ff;
+  border: 1px solid var(--violet);
+  border-radius: 999px;
+  padding: 0.45rem 0.95rem;
+  cursor: pointer;
   font-weight: 600;
 }
 
-.hint {
-  color: #555;
+.banner {
+  background: rgba(255, 107, 138, 0.12);
+  border: 1px solid var(--danger);
+  color: #ffd0d8;
+  padding: 0.75rem 1rem;
+  border-radius: 0.75rem;
+}
+
+.overview {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 1rem;
+  margin-bottom: 1.25rem;
+}
+
+.stat-card {
+  background: var(--navy-raised);
+  border: 1px solid var(--line);
+  border-radius: 1rem;
+  padding: 1.1rem 1.2rem;
+}
+
+.stat-label {
+  margin: 0;
+  font-size: 0.85rem;
+}
+
+.stat-value {
+  margin: 0.25rem 0 0;
+  font-size: 2.1rem;
+  font-weight: 700;
+}
+
+.stat-ok .stat-value {
+  color: var(--cyan);
+}
+
+.stat-drift .stat-value {
+  color: var(--violet);
+}
+
+.workspace {
+  display: grid;
+  grid-template-columns: minmax(260px, 0.9fr) minmax(320px, 1.3fr);
+  gap: 1rem;
+  align-items: start;
+}
+
+.panel {
+  background: var(--navy-raised);
+  border: 1px solid var(--line);
+  border-radius: 1rem;
+  padding: 1.15rem 1.2rem 1.3rem;
+}
+
+.panel h2 {
+  margin: 0 0 0.9rem;
+  font-size: 1.05rem;
+}
+
+.server-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0.45rem;
+}
+
+.server-row {
+  width: 100%;
+  display: flex;
+  justify-content: space-between;
+  gap: 0.75rem;
+  align-items: center;
+  text-align: left;
+  background: transparent;
+  color: inherit;
+  border: 1px solid transparent;
+  border-radius: 0.75rem;
+  padding: 0.7rem 0.75rem;
+  cursor: pointer;
+}
+
+.server-row:hover,
+.server-row.is-active {
+  background: var(--navy-hover);
+  border-color: var(--line);
+}
+
+.server-row.is-active {
+  box-shadow: inset 3px 0 0 var(--cyan);
+}
+
+.server-name {
+  display: block;
+  font-weight: 600;
+}
+
+.server-url {
+  display: block;
+  font-size: 0.78rem;
+  font-family: "IBM Plex Mono", ui-monospace, monospace;
+}
+
+.badge {
+  border-radius: 999px;
+  padding: 0.2rem 0.6rem;
+  font-size: 0.75rem;
+  font-weight: 600;
+  white-space: nowrap;
+}
+
+.badge-ok {
+  color: var(--navy);
+  background: var(--cyan);
+}
+
+.badge-drift {
+  color: #f5f0ff;
+  background: var(--violet);
+}
+
+.detail-head {
+  display: flex;
+  justify-content: space-between;
+  gap: 1rem;
+  align-items: flex-start;
+  margin-bottom: 0.5rem;
+}
+
+.detail-head h2 {
+  margin: 0;
+}
+
+.section-label {
+  margin: 1.2rem 0 0.55rem;
+  font-size: 0.78rem;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  color: var(--cyan);
+}
+
+.diff-list {
+  display: flex;
+  flex-direction: column;
+  gap: 0.75rem;
+}
+
+.diff-card {
+  border: 1px solid var(--line);
+  border-radius: 0.75rem;
+  padding: 0.75rem;
+}
+
+.diff-card h3 {
+  margin: 0 0 0.6rem;
   font-size: 0.95rem;
+  color: var(--violet);
+  text-transform: capitalize;
+}
+
+.diff-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 0.75rem;
+}
+
+.diff-label {
+  margin: 0 0 0.3rem;
+  font-size: 0.72rem;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+}
+
+pre {
+  margin: 0;
+  padding: 0.55rem;
+  background: #0b1020;
+  border-radius: 0.5rem;
+  overflow: auto;
+  font-family: "IBM Plex Mono", ui-monospace, monospace;
+  font-size: 0.78rem;
+  line-height: 1.4;
+}
+
+.explain section h3 {
+  margin: 0.85rem 0 0.3rem;
+  font-size: 0.95rem;
+  color: var(--cyan);
+}
+
+.explain p {
+  margin: 0;
+  line-height: 1.5;
+}
+
+.source-chip {
+  margin: 0;
+  font-size: 0.78rem;
+}
+
+.empty {
+  margin: 0;
+}
+
+@media (max-width: 860px) {
+  .overview,
+  .workspace,
+  .diff-grid,
+  .header {
+    grid-template-columns: 1fr;
+    display: grid;
+  }
+
+  .header,
+  .header-meta {
+    text-align: left;
+  }
 }

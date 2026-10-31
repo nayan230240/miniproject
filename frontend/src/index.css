@@ -1,12 +1,39 @@
-/* Global styles. Keep them tiny until a real design exists. */
+/* DriftWise global theme.
+   Navy is the canvas. Cyan marks healthy / interactive. Violet marks drift. */
+
+:root {
+  --navy: #0b1020;
+  --navy-raised: #12182c;
+  --navy-hover: #1a2240;
+  --cyan: #00d9ff;
+  --violet: #8b5cf6;
+  --text: #e8eef8;
+  --muted: #8b95b0;
+  --line: rgba(0, 217, 255, 0.14);
+  --danger: #ff6b8a;
+}
 
 * {
   box-sizing: border-box;
 }
 
+html,
+body,
+#root {
+  min-height: 100%;
+}
+
 body {
   margin: 0;
-  font-family: system-ui, sans-serif;
-  background: #f4f6f8;
-  color: #1a1a1a;
+  font-family: "IBM Plex Sans", system-ui, sans-serif;
+  background:
+    radial-gradient(1200px 500px at 10% -10%, rgba(139, 92, 246, 0.18), transparent 55%),
+    radial-gradient(900px 400px at 100% 0%, rgba(0, 217, 255, 0.12), transparent 50%),
+    var(--navy);
+  color: var(--text);
+}
+
+button,
+.server-row {
+  font: inherit;
 }

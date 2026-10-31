@@ -1,5 +1,5 @@
-# SQLite + SQLAlchemy setup (placeholder).
-# Nothing is stored yet — this just prepares the connection for later features.
+# SQLite + SQLAlchemy setup.
+# The poller and API routes share this engine and SessionLocal.
 
 import os
 
