@@ -78,7 +78,6 @@ class Baseline(Base):
 
     __tablename__ = "baselines"
 
-    # Configo uses one active baseline, with ID = 1.
     id = Column(Integer, primary_key=True, default=1)
 
     normalized_config = Column(JSON, nullable=False)
@@ -99,3 +98,24 @@ class Baseline(Base):
     )
 
     notes = Column(String, nullable=True)
+
+
+class AppSetting(Base):
+    """
+    Stores Configo application settings persistently in SQLite.
+
+    Each setting has a unique key and a JSON value.
+    """
+
+    __tablename__ = "app_settings"
+
+    key = Column(String, primary_key=True, index=True)
+
+    value = Column(JSON, nullable=False)
+
+    updated_at = Column(
+        DateTime,
+        default=lambda: datetime.now(timezone.utc),
+        onupdate=lambda: datetime.now(timezone.utc),
+        nullable=False,
+    )

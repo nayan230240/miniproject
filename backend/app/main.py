@@ -4,17 +4,18 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+from collections import defaultdict
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from typing import Any
 
-from fastapi import FastAPI, Depends, HTTPException
+from fastapi import FastAPI, Depends, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
 from app.database import Base, engine, SessionLocal, get_db
-from app.models import Server, Fingerprint, Baseline
+from app.models import Server, Fingerprint, Baseline, AppSetting
 from app.drift import detect_drift
 from app.explain import explain_server
 from app.demo import apply_golden_everywhere, simulate_live_drift
@@ -85,6 +86,128 @@ def baseline_to_dict(baseline: Baseline | None) -> dict:
 
 
 # --------------------------------------------------
+# HISTORY HELPERS
+# --------------------------------------------------
+
+def canonical_value(value: Any) -> str:
+    """Create a stable representation of a category value."""
+    return json.dumps(
+        value,
+        sort_keys=True,
+        separators=(",", ":"),
+        default=str
+    )
+
+
+def build_history_events(
+    db: Session,
+    server_id: int | None = None,
+    category: str | None = None,
+) -> list[dict]:
+    """
+    Build historical events by comparing consecutive fingerprints.
+    """
+
+    query = (
+        db.query(Fingerprint, Server.name)
+        .join(Server, Fingerprint.server_id == Server.id)
+    )
+
+    if server_id is not None:
+        query = query.filter(
+            Fingerprint.server_id == server_id
+        )
+
+    fingerprints = query.order_by(
+        Fingerprint.server_id.asc(),
+        Fingerprint.collected_at.asc(),
+        Fingerprint.id.asc()
+    ).all()
+
+    previous_configs: dict[int, dict] = {}
+    seen_values: dict[int, dict[str, set[str]]] = defaultdict(
+        lambda: defaultdict(set)
+    )
+
+    events = []
+
+    for fingerprint, server_name in fingerprints:
+        current_config = fingerprint.normalized_config or {}
+
+        if isinstance(current_config, str):
+            try:
+                current_config = json.loads(current_config)
+            except (json.JSONDecodeError, TypeError):
+                current_config = {}
+
+        if not isinstance(current_config, dict):
+            current_config = {}
+
+        current_config = normalize_config(current_config)
+
+        current_server_id = fingerprint.server_id
+        previous_config = previous_configs.get(current_server_id)
+
+        if previous_config is None:
+            for category_name, config_key in BASELINE_CATEGORIES.items():
+                if config_key in current_config:
+                    seen_values[current_server_id][category_name].add(
+                        canonical_value(current_config[config_key])
+                    )
+
+            previous_configs[current_server_id] = current_config
+            continue
+
+        for category_name, config_key in BASELINE_CATEGORIES.items():
+
+            if category is not None and category_name != category:
+                continue
+
+            previous_value = previous_config.get(config_key)
+            current_value = current_config.get(config_key)
+
+            previous_canonical = canonical_value(previous_value)
+            current_canonical = canonical_value(current_value)
+
+            if previous_canonical == current_canonical:
+                continue
+
+            known_values = seen_values[current_server_id][category_name]
+
+            event_type = (
+                "reverted"
+                if current_canonical in known_values
+                else "changed"
+            )
+
+            events.append({
+                "id": f"{fingerprint.id}-{category_name}",
+                "fingerprint_id": fingerprint.id,
+                "server_id": current_server_id,
+                "server_name": server_name,
+                "category": category_name,
+                "previous_value": previous_value,
+                "new_value": current_value,
+                "event_type": event_type,
+                "detected_at": fingerprint.collected_at,
+            })
+
+            known_values.add(current_canonical)
+
+        previous_configs[current_server_id] = current_config
+
+    events.sort(
+        key=lambda event: (
+            event["detected_at"],
+            event["fingerprint_id"]
+        ),
+        reverse=True
+    )
+
+    return events
+
+
+# --------------------------------------------------
 # REQUEST MODELS
 # --------------------------------------------------
 
@@ -99,6 +222,20 @@ class BaselineBody(BaseModel):
 
 class SimulateBody(BaseModel):
     server_id: int | None = None
+
+
+class SettingsBody(BaseModel):
+    poll_interval_seconds: int = Field(
+        default=30,
+        ge=10,
+        le=3600,
+        description="Polling interval between 10 and 3600 seconds"
+    )
+
+    theme: str = Field(
+        default="light",
+        pattern="^(light|dark)$"
+    )
 
 
 # --------------------------------------------------
@@ -199,6 +336,74 @@ def health():
 
 
 # --------------------------------------------------
+# SETTINGS ENDPOINTS
+# --------------------------------------------------
+
+@app.get("/settings")
+def get_settings(db: Session = Depends(get_db)):
+    """Retrieve saved Configo application settings."""
+
+    poll_setting = db.get(
+        AppSetting,
+        "poll_interval_seconds"
+    )
+
+    theme_setting = db.get(
+        AppSetting,
+        "theme"
+    )
+
+    return {
+        "poll_interval_seconds": (
+            poll_setting.value if poll_setting else 30
+        ),
+        "theme": (
+            theme_setting.value if theme_setting else "light"
+        ),
+    }
+
+
+@app.put("/settings")
+def update_settings(
+    body: SettingsBody,
+    db: Session = Depends(get_db),
+):
+    """Save Configo application settings in SQLite."""
+
+    settings_to_save = {
+        "poll_interval_seconds": body.poll_interval_seconds,
+        "theme": body.theme,
+    }
+
+    for key, value in settings_to_save.items():
+        setting = db.get(AppSetting, key)
+
+        if setting is None:
+            setting = AppSetting(
+                key=key,
+                value=value
+            )
+            db.add(setting)
+        else:
+            setting.value = value
+
+    try:
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise HTTPException(
+            status_code=500,
+            detail="Unable to save application settings."
+        )
+
+    return {
+        "message": "Settings saved successfully",
+        "poll_interval_seconds": body.poll_interval_seconds,
+        "theme": body.theme,
+    }
+
+
+# --------------------------------------------------
 # SERVER ENDPOINTS
 # --------------------------------------------------
 
@@ -234,16 +439,60 @@ def get_server_fingerprints(
 
 
 # --------------------------------------------------
+# DRIFT HISTORY ENDPOINT
+# --------------------------------------------------
+
+@app.get("/history")
+def get_drift_history(
+    server_id: int | None = Query(default=None, ge=1),
+    category: str | None = Query(default=None),
+    limit: int = Query(default=100, ge=1, le=500),
+    offset: int = Query(default=0, ge=0),
+    db: Session = Depends(get_db)
+):
+    if category is not None and category not in BASELINE_CATEGORIES:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Invalid category. Available categories: "
+                + ", ".join(BASELINE_CATEGORIES.keys())
+            )
+        )
+
+    if server_id is not None:
+        server = db.query(Server).filter(
+            Server.id == server_id
+        ).first()
+
+        if server is None:
+            raise HTTPException(
+                status_code=404,
+                detail="Server not found"
+            )
+
+    events = build_history_events(
+        db=db,
+        server_id=server_id,
+        category=category
+    )
+
+    total_events = len(events)
+    paginated_events = events[offset:offset + limit]
+
+    return {
+        "total_events": total_events,
+        "limit": limit,
+        "offset": offset,
+        "events": paginated_events,
+    }
+
+
+# --------------------------------------------------
 # APPROVED BASELINE ENDPOINTS
 # --------------------------------------------------
 
 @app.get("/baseline")
 def get_baseline(db: Session = Depends(get_db)):
-    """
-    Return the currently approved original baseline.
-
-    Reading the baseline never changes it.
-    """
     baseline = db.get(Baseline, 1)
 
     return baseline_to_dict(baseline)
@@ -254,12 +503,6 @@ def capture_baseline(
     body: BaselineBody,
     db: Session = Depends(get_db)
 ):
-    """
-    Save an explicitly supplied approved configuration.
-
-    The existing baseline cannot be overwritten unless
-    replace=true is explicitly supplied.
-    """
     config = normalize_config(body.config)
 
     if not config:
@@ -322,11 +565,6 @@ def capture_baseline(
 
 @app.delete("/baseline")
 def delete_baseline(db: Session = Depends(get_db)):
-    """
-    Explicitly delete the approved baseline.
-
-    This does not delete server fingerprints.
-    """
     baseline = db.get(Baseline, 1)
 
     if baseline is None:
@@ -349,12 +587,6 @@ def delete_baseline(db: Session = Depends(get_db)):
 
 @app.get("/drift")
 def get_drift(db: Session = Depends(get_db)):
-    """
-    Compare:
-    1. Every server against the current majority.
-    2. Every server against the approved baseline.
-    3. The majority configuration against the baseline.
-    """
     return detect_drift(db)
 
 
@@ -422,10 +654,7 @@ async def simulate_drift(
 @app.post("/demo/reset")
 async def reset_demo():
     """
-    Reset all simulated fleet servers to the demo golden config.
-
-    IMPORTANT:
-    This does not capture, update, or replace the approved baseline.
+    Reset simulated fleet servers without changing the approved baseline.
     """
     try:
         await apply_golden_everywhere()
