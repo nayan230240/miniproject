@@ -1,187 +1,444 @@
-# Configo API entry point.
-# Run locally: uvicorn app.main:app --reload
-# Open docs at: http://localhost:8000/docs
-#
-# Endpoints:
-#   GET /health
-#   GET /servers
-#   GET /servers/{id}/fingerprints
-#   GET /drift
-#   GET /drift/{server_id}/explanation
-#   POST /simulate-drift
-#   POST /demo/reset
 
-from contextlib import asynccontextmanager
+from __future__ import annotations
 
 import asyncio
+import hashlib
+import json
+from contextlib import asynccontextmanager
+from datetime import datetime, timezone
+from typing import Any
 
-from fastapi import Depends, FastAPI, HTTPException
+from fastapi import FastAPI, Depends, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from sqlalchemy import select
+from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
-from pydantic import BaseModel, Field
-
-from app.database import Base, engine, get_db
-from app.demo import apply_golden_everywhere, simulate_live_drift
+from app.database import Base, engine, SessionLocal, get_db
+from app.models import Server, Fingerprint, Baseline
 from app.drift import detect_drift
 from app.explain import explain_server
-from app.models import Fingerprint, Server
+from app.demo import apply_golden_everywhere, simulate_live_drift
 from app.poller import poll_loop
 
 
+# --------------------------------------------------
+# BASELINE CONFIGURATION
+# --------------------------------------------------
+
+BASELINE_CATEGORIES = {
+    "os_version": "os_version",
+    "kernel_version": "kernel_version",
+    "installed_packages": "installed_packages",
+    "open_ports": "open_ports",
+    "environment_variables": "environment_variables",
+    "ssh_settings": "ssh_settings",
+}
+
+
+def normalize_config(config: dict[str, Any]) -> dict[str, Any]:
+    """Return a consistent JSON-compatible configuration."""
+    return json.loads(
+        json.dumps(config, sort_keys=True, default=str)
+    )
+
+
+def calculate_category_hashes(
+    config: dict[str, Any]
+) -> dict[str, str]:
+    """Calculate SHA-256 hashes for each configuration category."""
+    hashes = {}
+
+    for category, config_key in BASELINE_CATEGORIES.items():
+        value = config.get(config_key)
+
+        canonical_value = json.dumps(
+            value,
+            sort_keys=True,
+            separators=(",", ":"),
+            default=str
+        )
+
+        hashes[category] = hashlib.sha256(
+            canonical_value.encode("utf-8")
+        ).hexdigest()
+
+    return hashes
+
+
+def baseline_to_dict(baseline: Baseline | None) -> dict:
+    if baseline is None:
+        return {
+            "configured": False,
+            "config": None,
+            "created_at": None,
+            "updated_at": None,
+            "notes": None,
+        }
+
+    return {
+        "configured": True,
+        "config": baseline.normalized_config,
+        "created_at": baseline.created_at,
+        "updated_at": baseline.updated_at,
+        "notes": baseline.notes,
+    }
+
+
+# --------------------------------------------------
+# REQUEST MODELS
+# --------------------------------------------------
+
+class BaselineBody(BaseModel):
+    config: dict[str, Any] = Field(
+        ...,
+        description="Approved original server configuration"
+    )
+    notes: str | None = None
+    replace: bool = False
+
+
+class SimulateBody(BaseModel):
+    server_id: int | None = None
+
+
+# --------------------------------------------------
+# APPLICATION LIFECYCLE
+# --------------------------------------------------
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # 1) Make sure SQLite tables exist.
     Base.metadata.create_all(bind=engine)
-    # 2) Start the 30-second fleet poller in the background.
-    task = asyncio.create_task(poll_loop())
+
+    poller_task = asyncio.create_task(poll_loop())
+
     yield
-    # 3) Stop the poller when Uvicorn shuts down.
-    task.cancel()
+
+    poller_task.cancel()
+
     try:
-        await task
+        await poller_task
     except asyncio.CancelledError:
         pass
 
 
 app = FastAPI(
-    title="Configo",
-    description="AI-powered configuration drift detector.",
-    version="0.0.1",
+    title="Configo - AI Server Drift Detector",
+    description=(
+        "Detect server configuration drift using majority "
+        "comparison, approved baseline verification, and Gemini AI."
+    ),
+    version="2.0.0",
     lifespan=lifespan,
 )
 
-# The React app runs on another port, so we allow browser requests from anywhere for now.
+
+# --------------------------------------------------
+# CORS
+# --------------------------------------------------
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
-    allow_credentials=False,
+    allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
 
-def fingerprint_to_dict(row: Fingerprint) -> dict:
-    """Turn a database row into JSON for the API."""
+# --------------------------------------------------
+# SERIALIZATION HELPERS
+# --------------------------------------------------
+
+def fingerprint_to_dict(fingerprint: Fingerprint) -> dict:
     return {
-        "id": row.id,
-        "server_id": row.server_id,
-        "collected_at": row.collected_at.isoformat() if row.collected_at else None,
-        "full_hash": row.full_hash,
-        "category_hashes": {
-            "os_version": row.os_version_hash,
-            "kernel_version": row.kernel_version_hash,
-            "installed_packages": row.packages_hash,
-            "open_ports": row.ports_hash,
-            "environment_variables": row.env_vars_hash,
-            "ssh_settings": row.ssh_hash,
-        },
-        "normalized_config": row.normalized_config,
+        "id": fingerprint.id,
+        "server_id": fingerprint.server_id,
+        "collected_at": fingerprint.collected_at,
+        "full_hash": fingerprint.full_hash,
+        "os_version_hash": fingerprint.os_version_hash,
+        "kernel_version_hash": fingerprint.kernel_version_hash,
+        "packages_hash": fingerprint.packages_hash,
+        "ports_hash": fingerprint.ports_hash,
+        "env_vars_hash": fingerprint.env_vars_hash,
+        "ssh_hash": fingerprint.ssh_hash,
+        "normalized_config": fingerprint.normalized_config,
     }
 
 
-def server_to_dict(server: Server, latest: Fingerprint | None = None) -> dict:
+def server_to_dict(server: Server) -> dict:
+    latest = (
+        server.fingerprints[0]
+        if server.fingerprints
+        else None
+    )
+
     return {
         "id": server.id,
         "name": server.name,
         "base_url": server.base_url,
-        "last_seen_at": server.last_seen_at.isoformat() if server.last_seen_at else None,
-        "latest_fingerprint": fingerprint_to_dict(latest) if latest else None,
+        "last_seen_at": server.last_seen_at,
+        "latest_fingerprint": (
+            fingerprint_to_dict(latest)
+            if latest
+            else None
+        ),
     }
 
+
+# --------------------------------------------------
+# HEALTH CHECK
+# --------------------------------------------------
 
 @app.get("/health")
 def health():
-    """Simple liveness check used by Docker and by you in the browser."""
-    return {"status": "ok", "service": "configo-backend"}
+    return {
+        "status": "ok",
+        "application": "Configo",
+        "version": "2.0.0",
+    }
 
+
+# --------------------------------------------------
+# SERVER ENDPOINTS
+# --------------------------------------------------
 
 @app.get("/servers")
-def list_servers(db: Session = Depends(get_db)):
-    """
-    List every fleet server we have seen, plus its newest fingerprint.
-    Empty until the poller has completed at least one successful fetch.
-    """
-    servers = db.scalars(select(Server).order_by(Server.id)).all()
-    result = []
-    for server in servers:
-        latest = db.scalar(
-            select(Fingerprint)
-            .where(Fingerprint.server_id == server.id)
-            .order_by(Fingerprint.collected_at.desc(), Fingerprint.id.desc())
-        )
-        result.append(server_to_dict(server, latest))
-    return result
+def get_servers(db: Session = Depends(get_db)):
+    servers = db.query(Server).order_by(Server.id).all()
+
+    return [
+        server_to_dict(server)
+        for server in servers
+    ]
 
 
 @app.get("/servers/{server_id}/fingerprints")
-def list_fingerprints(server_id: int, db: Session = Depends(get_db)):
-    """Return the fingerprint history for one server (newest first)."""
-    server = db.get(Server, server_id)
-    if server is None:
-        raise HTTPException(status_code=404, detail=f"Server {server_id} not found")
+def get_server_fingerprints(
+    server_id: int,
+    db: Session = Depends(get_db)
+):
+    server = db.query(Server).filter(
+        Server.id == server_id
+    ).first()
 
-    rows = db.scalars(
-        select(Fingerprint)
-        .where(Fingerprint.server_id == server_id)
-        .order_by(Fingerprint.collected_at.desc(), Fingerprint.id.desc())
-    ).all()
+    if server is None:
+        raise HTTPException(
+            status_code=404,
+            detail="Server not found"
+        )
+
+    return [
+        fingerprint_to_dict(item)
+        for item in server.fingerprints
+    ]
+
+
+# --------------------------------------------------
+# APPROVED BASELINE ENDPOINTS
+# --------------------------------------------------
+
+@app.get("/baseline")
+def get_baseline(db: Session = Depends(get_db)):
+    """
+    Return the currently approved original baseline.
+
+    Reading the baseline never changes it.
+    """
+    baseline = db.get(Baseline, 1)
+
+    return baseline_to_dict(baseline)
+
+
+@app.post("/baseline/capture")
+def capture_baseline(
+    body: BaselineBody,
+    db: Session = Depends(get_db)
+):
+    """
+    Save an explicitly supplied approved configuration.
+
+    The existing baseline cannot be overwritten unless
+    replace=true is explicitly supplied.
+    """
+    config = normalize_config(body.config)
+
+    if not config:
+        raise HTTPException(
+            status_code=400,
+            detail="Baseline configuration cannot be empty."
+        )
+
+    for key in BASELINE_CATEGORIES.values():
+        if key not in config:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Missing baseline configuration category: {key}"
+            )
+
+    existing = db.get(Baseline, 1)
+
+    if existing is not None and not body.replace:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "An approved baseline already exists. "
+                "Set replace=true only when you intentionally "
+                "want to replace the approved baseline."
+            )
+        )
+
+    now = datetime.now(timezone.utc)
+
+    if existing is None:
+        baseline = Baseline(
+            id=1,
+            normalized_config=config,
+            category_hashes=calculate_category_hashes(config),
+            created_at=now,
+            updated_at=now,
+            notes=body.notes,
+        )
+        db.add(baseline)
+
+    else:
+        existing.normalized_config = config
+        existing.category_hashes = calculate_category_hashes(config)
+        existing.updated_at = now
+        existing.notes = body.notes
+
+    db.commit()
+
+    saved_baseline = db.get(Baseline, 1)
+
     return {
-        "server": server_to_dict(server),
-        "fingerprints": [fingerprint_to_dict(row) for row in rows],
+        "message": (
+            "Approved baseline saved successfully."
+            if existing is None
+            else "Approved baseline replaced successfully."
+        ),
+        "baseline": baseline_to_dict(saved_baseline),
     }
 
+
+@app.delete("/baseline")
+def delete_baseline(db: Session = Depends(get_db)):
+    """
+    Explicitly delete the approved baseline.
+
+    This does not delete server fingerprints.
+    """
+    baseline = db.get(Baseline, 1)
+
+    if baseline is None:
+        raise HTTPException(
+            status_code=404,
+            detail="No baseline is currently configured."
+        )
+
+    db.delete(baseline)
+    db.commit()
+
+    return {
+        "message": "Approved baseline deleted."
+    }
+
+
+# --------------------------------------------------
+# DRIFT DETECTION
+# --------------------------------------------------
 
 @app.get("/drift")
 def get_drift(db: Session = Depends(get_db)):
     """
-    Group servers by config similarity and list outliers.
-
-    Uses the newest fingerprint for each server. See app/drift.py for
-    the DBSCAN explanation.
+    Compare:
+    1. Every server against the current majority.
+    2. Every server against the approved baseline.
+    3. The majority configuration against the baseline.
     """
     return detect_drift(db)
 
 
 @app.get("/drift/{server_id}/explanation")
-def get_drift_explanation(server_id: int, db: Session = Depends(get_db)):
-    """
-    Ask an LLM to narrate one server's drift in plain language.
+def get_drift_explanation(
+    server_id: int,
+    db: Session = Depends(get_db)
+):
+    server = db.query(Server).filter(
+        Server.id == server_id
+    ).first()
 
-    If the API key is missing or the vendor call fails, a fallback summary
-    is returned instead of an error. See app/explain.py.
-    """
+    if server is None:
+        raise HTTPException(
+            status_code=404,
+            detail="Server not found"
+        )
+
     try:
         return explain_server(db, server_id)
-    except ValueError as exc:
-        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    except ValueError as error:
+        raise HTTPException(
+            status_code=400,
+            detail=str(error)
+        )
+
+    except Exception as error:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Unable to generate explanation: {str(error)}"
+        )
 
 
-class SimulateBody(BaseModel):
-    # Optional: which host to poke. If omitted (or already drifted), we pick a healthy one.
-    server_id: int | None = Field(default=None)
-
+# --------------------------------------------------
+# DEMO ENDPOINTS
+# --------------------------------------------------
 
 @app.post("/simulate-drift")
-async def post_simulate_drift(body: SimulateBody = SimulateBody(), db: Session = Depends(get_db)):
-    """
-    Change one fake server's config *right now*, then poll it so detection
-    does not wait for the 30-second timer. Used by the DriftWise button.
-    """
+async def simulate_drift(
+    body: SimulateBody,
+    db: Session = Depends(get_db)
+):
     try:
-        return await simulate_live_drift(db, body.server_id)
-    except ValueError as exc:
-        raise HTTPException(status_code=409, detail=str(exc)) from exc
-    except Exception as exc:
-        raise HTTPException(status_code=502, detail=f"Could not reach fleet host: {exc}") from exc
+        result = await simulate_live_drift(
+            db,
+            body.server_id
+        )
+
+        return result
+
+    except ValueError as error:
+        raise HTTPException(
+            status_code=400,
+            detail=str(error)
+        )
+
+    except Exception as error:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Unable to simulate drift: {str(error)}"
+        )
 
 
 @app.post("/demo/reset")
-async def post_demo_reset():
-    """Put every fleet host back on the golden config (healthy fleet)."""
+async def reset_demo():
+    """
+    Reset all simulated fleet servers to the demo golden config.
+
+    IMPORTANT:
+    This does not capture, update, or replace the approved baseline.
+    """
     try:
         await apply_golden_everywhere()
-    except Exception as exc:
-        raise HTTPException(status_code=502, detail=f"Demo reset failed: {exc}") from exc
-    return {"ok": True, "message": "All fleet hosts reset to the golden baseline"}
+
+        return {
+            "message": (
+                "Demo fleet configuration reset successfully. "
+                "The approved baseline was not changed."
+            )
+        }
+
+    except Exception as error:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Unable to reset demo fleet: {str(error)}"
+        )

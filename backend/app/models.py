@@ -1,60 +1,101 @@
-# Database tables for Configo.
-# Think of these as spreadsheets stored in SQLite:
-#   servers       = one row per simulated fleet machine
-#   fingerprints  = one row per poll (every ~30 seconds)
 
-from datetime import datetime
+from datetime import datetime, timezone
 
-from sqlalchemy import DateTime, ForeignKey, Integer, String, Text
-from sqlalchemy.orm import Mapped, mapped_column, relationship
+from sqlalchemy import (
+    Column,
+    Integer,
+    String,
+    DateTime,
+    ForeignKey,
+    JSON,
+)
+from sqlalchemy.orm import relationship
 
 from app.database import Base
 
 
 class Server(Base):
-    """A fleet machine we poll, for example fleet-1 at http://fleet-1:8000."""
-
     __tablename__ = "servers"
 
-    id: Mapped[int] = mapped_column(Integer, primary_key=True)
-    # Human-readable name, taken from the URL host (fleet-1, fleet-2, ...).
-    name: Mapped[str] = mapped_column(String(64), unique=True, index=True)
-    # Base URL we call, without the /config path.
-    base_url: Mapped[str] = mapped_column(String(255))
-    # Last time we successfully fetched /config.
-    last_seen_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    id = Column(Integer, primary_key=True, index=True)
+    name = Column(String, unique=True, nullable=False)
+    base_url = Column(String, nullable=False)
 
-    # One server has many fingerprints over time.
-    fingerprints: Mapped[list["Fingerprint"]] = relationship(
+    last_seen_at = Column(DateTime, nullable=True)
+
+    fingerprints = relationship(
+        "Fingerprint",
         back_populates="server",
         cascade="all, delete-orphan",
+        order_by="Fingerprint.collected_at.desc()",
     )
 
 
 class Fingerprint(Base):
-    """
-    A snapshot of a server's config, stored as hashes.
-
-    Why hashes? They are short, comparable, and do not need a full diff
-    to answer "did this category change since last time?"
-    """
-
     __tablename__ = "fingerprints"
 
-    id: Mapped[int] = mapped_column(Integer, primary_key=True)
-    server_id: Mapped[int] = mapped_column(ForeignKey("servers.id"), index=True)
-    collected_at: Mapped[datetime] = mapped_column(DateTime, index=True)
+    id = Column(Integer, primary_key=True, index=True)
 
-    # SHA-256 of the entire normalized config JSON.
-    full_hash: Mapped[str] = mapped_column(String(64))
-    # SHA-256 of each category, so we can see *what* drifted later.
-    os_version_hash: Mapped[str] = mapped_column(String(64))
-    kernel_version_hash: Mapped[str] = mapped_column(String(64))
-    packages_hash: Mapped[str] = mapped_column(String(64))
-    ports_hash: Mapped[str] = mapped_column(String(64))
-    env_vars_hash: Mapped[str] = mapped_column(String(64))
-    ssh_hash: Mapped[str] = mapped_column(String(64))
-    # Canonical JSON that was hashed (handy when you inspect the database).
-    normalized_config: Mapped[str] = mapped_column(Text)
+    server_id = Column(
+        Integer,
+        ForeignKey("servers.id"),
+        nullable=False,
+        index=True,
+    )
 
-    server: Mapped["Server"] = relationship(back_populates="fingerprints")
+    collected_at = Column(
+        DateTime,
+        default=lambda: datetime.now(timezone.utc),
+        nullable=False,
+        index=True,
+    )
+
+    full_hash = Column(String, nullable=False)
+
+    os_version_hash = Column(String, nullable=False)
+    kernel_version_hash = Column(String, nullable=False)
+    packages_hash = Column(String, nullable=False)
+    ports_hash = Column(String, nullable=False)
+    env_vars_hash = Column(String, nullable=False)
+    ssh_hash = Column(String, nullable=False)
+
+    normalized_config = Column(JSON, nullable=False)
+
+    server = relationship(
+        "Server",
+        back_populates="fingerprints",
+    )
+
+
+class Baseline(Base):
+    """
+    Stores Configo's original engineer-approved configuration.
+
+    The baseline is independent of the current fleet majority.
+    It must only change when an engineer intentionally approves
+    a new baseline.
+    """
+
+    __tablename__ = "baselines"
+
+    # Configo uses one active baseline, with ID = 1.
+    id = Column(Integer, primary_key=True, default=1)
+
+    normalized_config = Column(JSON, nullable=False)
+
+    category_hashes = Column(JSON, nullable=False)
+
+    created_at = Column(
+        DateTime,
+        default=lambda: datetime.now(timezone.utc),
+        nullable=False,
+    )
+
+    updated_at = Column(
+        DateTime,
+        default=lambda: datetime.now(timezone.utc),
+        onupdate=lambda: datetime.now(timezone.utc),
+        nullable=False,
+    )
+
+    notes = Column(String, nullable=True)

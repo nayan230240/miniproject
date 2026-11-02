@@ -31,10 +31,12 @@ services:
       POLL_INTERVAL_SECONDS: "30"
       # LLM key is read from your shell / a local .env file. Never commit a real key.
       # ${LLM_API_KEY:-} means "use the host env, or empty if unset" (fallback kicks in).
-      LLM_API_KEY: ${LLM_API_KEY:-}
-      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
-      LLM_API_URL: ${LLM_API_URL:-https://api.openai.com/v1/chat/completions}
-      LLM_MODEL: ${LLM_MODEL:-gpt-4o-mini}
+      
+      # Gemini AI configuration
+      AI_PROVIDER: ${AI_PROVIDER:-gemini}
+      AI_API_KEY: ${AI_API_KEY:-}
+      GEMINI_MODEL: ${GEMINI_MODEL:-gemini-2.5-flash}
+
     volumes:
       - configo-db:/app/data
     healthcheck:
@@ -117,3 +119,4 @@ services:
 
 volumes:
   configo-db:
+   

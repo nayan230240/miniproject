@@ -1,185 +1,366 @@
-# Drift detector.
-#
-# Algorithm (plain English):
-#   1. Take the newest fingerprint for every server.
-#   2. Compare servers by their *category hashes* (packages, ports, ssh, ...).
-#      Distance = how many categories differ (0 = identical config).
-#   3. Run DBSCAN from scikit-learn on that distance matrix.
-#      Servers with distance 0 are neighbors. A group of 2+ identical
-#      servers becomes a cluster. Unique machines are labeled -1 (noise).
-#   4. The largest cluster is the "majority" (the golden config).
-#   5. Anyone not in that cluster is an outlier. For each outlier we
-#      list the categories whose hashes differ from the majority.
-#
-# Why hashes instead of raw JSON?
-#   Comparing six short strings is enough to know *which* section drifted.
-#   We still attach the real JSON values so the API can show the difference.
 
 from __future__ import annotations
 
 import json
-from collections import Counter
+from collections import defaultdict
+from typing import Any
 
-import numpy as np
-from sklearn.cluster import DBSCAN
-from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from app.models import Fingerprint, Server
-
-# Names shown in GET /drift, paired with the Fingerprint columns we compare.
-CATEGORIES = [
-    ("os_version", "os_version_hash"),
-    ("kernel_version", "kernel_version_hash"),
-    ("installed_packages", "packages_hash"),
-    ("open_ports", "ports_hash"),
-    ("environment_variables", "env_vars_hash"),
-    ("ssh_settings", "ssh_hash"),
-]
+from app.models import Baseline, Fingerprint, Server
 
 
-def latest_fingerprint(db: Session, server_id: int) -> Fingerprint | None:
-    return db.scalar(
-        select(Fingerprint)
-        .where(Fingerprint.server_id == server_id)
-        .order_by(Fingerprint.collected_at.desc(), Fingerprint.id.desc())
+# --------------------------------------------------
+# CONFIGURATION CATEGORIES
+# --------------------------------------------------
+
+CATEGORIES = {
+    "os_version": "os_version",
+    "kernel_version": "kernel_version",
+    "installed_packages": "installed_packages",
+    "open_ports": "open_ports",
+    "environment_variables": "environment_variables",
+    "ssh_settings": "ssh_settings",
+}
+
+
+# --------------------------------------------------
+# CONFIGURATION NORMALIZATION
+# --------------------------------------------------
+
+def normalize_config(config: Any) -> dict:
+    """
+    Convert stored JSON strings or dictionaries into
+    a consistent Python dictionary.
+    """
+
+    if config is None:
+        return {}
+
+    # Handle JSON strings, including double-encoded JSON.
+    while isinstance(config, str):
+        try:
+            config = json.loads(config)
+        except (json.JSONDecodeError, TypeError):
+            return {}
+
+    if isinstance(config, dict):
+        return config
+
+    return {}
+
+
+def canonical_config(config: dict) -> str:
+    """Create a stable representation for comparison."""
+
+    return json.dumps(
+        config,
+        sort_keys=True,
+        separators=(",", ":"),
+        default=str
     )
 
 
-def snapshots(db: Session) -> list[tuple[Server, Fingerprint]]:
-    """One (server, newest fingerprint) pair per machine we have seen."""
-    servers = db.scalars(select(Server).order_by(Server.id)).all()
-    rows = []
+# --------------------------------------------------
+# FETCH LATEST SERVER SNAPSHOTS
+# --------------------------------------------------
+
+def snapshots(db: Session) -> list[dict]:
+    """
+    Get the latest fingerprint for every registered server.
+    """
+
+    servers = db.query(Server).order_by(Server.id).all()
+
+    result = []
+
     for server in servers:
-        fp = latest_fingerprint(db, server.id)
-        if fp is not None:
-            rows.append((server, fp))
-    return rows
-
-
-def category_hashes(fp: Fingerprint) -> list[str]:
-    return [getattr(fp, column) for _, column in CATEGORIES]
-
-
-def hamming_distance_matrix(hash_rows: list[list[str]]) -> np.ndarray:
-    """
-    Distance[i][j] = number of categories that differ between server i and j.
-    Example: same everything except openssl -> distance 1.
-    """
-    n = len(hash_rows)
-    matrix = np.zeros((n, n), dtype=float)
-    for i in range(n):
-        for j in range(i + 1, n):
-            dist = sum(a != b for a, b in zip(hash_rows[i], hash_rows[j]))
-            matrix[i, j] = matrix[j, i] = dist
-    return matrix
-
-
-def cluster_labels(hash_rows: list[list[str]]) -> list[int]:
-    """
-    DBSCAN settings:
-      metric='precomputed'  -> we pass our Hamming matrix
-      eps=0.5               -> only distance 0 (perfect match) counts as neighbors
-      min_samples=2         -> a cluster needs at least two identical servers
-    Isolated machines (the drifted ones in this demo) get label -1.
-    """
-    if len(hash_rows) == 0:
-        return []
-    if len(hash_rows) == 1:
-        return [0]
-    matrix = hamming_distance_matrix(hash_rows)
-    model = DBSCAN(eps=0.5, min_samples=2, metric="precomputed")
-    return [int(label) for label in model.fit_predict(matrix)]
-
-
-def majority_cluster_id(labels: list[int]) -> int | None:
-    """Largest non-noise cluster. None if nobody clustered (all unique)."""
-    counted = Counter(label for label in labels if label != -1)
-    if not counted:
-        return None
-    # Tie-break: bigger count, then smaller cluster id.
-    return sorted(counted, key=lambda label: (-counted[label], label))[0]
-
-
-def config_value(fp: Fingerprint, category: str):
-    """Read one category out of the stored normalized JSON."""
-    try:
-        payload = json.loads(fp.normalized_config)
-    except (TypeError, json.JSONDecodeError):
-        return None
-    return payload.get(category)
-
-
-def detect_drift(db: Session) -> dict:
-    """Build the GET /drift payload from the latest fingerprints."""
-    rows = snapshots(db)
-    labels = cluster_labels([category_hashes(fp) for _, fp in rows])
-    majority_id = majority_cluster_id(labels)
-
-    clusters: dict[int, list[dict]] = {}
-    for (server, fp), label in zip(rows, labels):
-        clusters.setdefault(label, []).append(
-            {"id": server.id, "name": server.name, "fingerprint_id": fp.id}
+        latest = (
+            db.query(Fingerprint)
+            .filter(Fingerprint.server_id == server.id)
+            .order_by(Fingerprint.collected_at.desc())
+            .first()
         )
 
-    majority_members = [
-        (server, fp)
-        for (server, fp), label in zip(rows, labels)
-        if majority_id is not None and label == majority_id
-    ]
-    # Baseline = first majority server (they all share the same category hashes).
-    baseline = majority_members[0][1] if majority_members else None
+        if latest is None:
+            continue
 
-    outliers = []
-    for (server, fp), label in zip(rows, labels):
-        if majority_id is not None and label == majority_id:
-            continue
-        if baseline is None:
-            # No majority at all (every host unique). Compare to nothing useful.
-            continue
-        differing = []
-        for category, column in CATEGORIES:
-            if getattr(fp, column) != getattr(baseline, column):
-                differing.append(
-                    {
-                        "category": category,
-                        "majority_value": config_value(baseline, category),
-                        "server_value": config_value(fp, category),
-                    }
-                )
-        if not differing:
-            continue
-        outliers.append(
-            {
-                "server_id": server.id,
-                "name": server.name,
-                "cluster_id": label,
-                "fingerprint_id": fp.id,
-                "full_hash": fp.full_hash,
-                "collected_at": fp.collected_at.isoformat() if fp.collected_at else None,
-                "differing_categories": differing,
-            }
-        )
+        config = normalize_config(latest.normalized_config)
+
+        result.append({
+            "id": server.id,
+            "name": server.name,
+            "server": server,
+            "fingerprint": latest,
+            "config": config,
+        })
+
+    return result
+
+
+# --------------------------------------------------
+# CATEGORY COMPARISON
+# --------------------------------------------------
+
+def differing_categories(
+    reference_config: Any,
+    comparison_config: Any
+) -> list[dict]:
+
+    reference_config = normalize_config(reference_config)
+    comparison_config = normalize_config(comparison_config)
+
+    differences = []
+
+    for category, config_key in CATEGORIES.items():
+
+        reference_value = reference_config.get(config_key)
+        comparison_value = comparison_config.get(config_key)
+
+        if canonical_config({"value": reference_value}) != canonical_config(
+            {"value": comparison_value}
+        ):
+            differences.append({
+                "category": category,
+                "majority_value": reference_value,
+                "server_value": comparison_value,
+            })
+
+    return differences
+
+
+def compare_with_baseline(
+    current_config: Any,
+    baseline_config: Any
+) -> list[dict]:
+
+    current_config = normalize_config(current_config)
+    baseline_config = normalize_config(baseline_config)
+
+    differences = []
+
+    for category, config_key in CATEGORIES.items():
+
+        baseline_value = baseline_config.get(config_key)
+        current_value = current_config.get(config_key)
+
+        if canonical_config({"value": baseline_value}) != canonical_config(
+            {"value": current_value}
+        ):
+            differences.append({
+                "category": category,
+                "baseline_value": baseline_value,
+                "current_value": current_value,
+            })
+
+    return differences
+
+
+# --------------------------------------------------
+# BUILD MAJORITY CONFIGURATION
+# --------------------------------------------------
+
+def build_majority(snapshot_list: list[dict]) -> dict:
+
+    groups = defaultdict(list)
+
+    for item in snapshot_list:
+        config = normalize_config(item["config"])
+        groups[canonical_config(config)].append(item)
+
+    if not groups:
+        return {
+            "servers": [],
+            "config": {},
+            "count": 0,
+            "total_servers": 0,
+            "percentage": 0,
+            "has_majority": False,
+        }
+
+    majority_key = max(
+        groups,
+        key=lambda key: len(groups[key])
+    )
+
+    majority_group = groups[majority_key]
+
+    total = len(snapshot_list)
+    count = len(majority_group)
 
     return {
-        "algorithm": "DBSCAN on Hamming distance of category hashes",
-        "explanation": (
-            "Each server is six hashes (os, kernel, packages, ports, env, ssh). "
-            "Distance is how many of those hashes differ. DBSCAN groups servers "
-            "that match on every category. The biggest group is the majority. "
-            "Everyone else is an outlier, with the exact categories that drifted."
-        ),
-        "parameters": {"eps": 0.5, "min_samples": 2, "metric": "precomputed"},
-        "majority": {
-            "cluster_id": majority_id,
-            "server_count": len(majority_members),
-            "servers": [
-                {"id": server.id, "name": server.name} for server, _ in majority_members
-            ],
-        },
-        "clusters": [
-            {"cluster_id": cluster_id, "servers": members}
-            for cluster_id, members in sorted(clusters.items(), key=lambda item: item[0])
+        "servers": [
+            {
+                "id": item["id"],
+                "name": item["name"],
+            }
+            for item in majority_group
         ],
+        "config": normalize_config(majority_group[0]["config"]),
+        "count": count,
+        "total_servers": total,
+        "percentage": round((count / total) * 100, 2),
+        "has_majority": count > total / 2,
+    }
+
+
+# --------------------------------------------------
+# MAIN DRIFT DETECTION
+# --------------------------------------------------
+
+def detect_drift(db: Session) -> dict:
+
+    snapshot_list = snapshots(db)
+
+    total_servers = len(snapshot_list)
+
+    majority = build_majority(snapshot_list)
+
+    majority_config = normalize_config(majority["config"])
+
+    # Fetch the approved original baseline.
+    baseline_record = db.get(Baseline, 1)
+
+    baseline_config = (
+        normalize_config(baseline_record.normalized_config)
+        if baseline_record is not None
+        else None
+    )
+
+    # --------------------------------------------------
+    # COMPARE EVERY SERVER
+    # --------------------------------------------------
+
+    outliers = []
+    server_comparisons = []
+
+    for item in snapshot_list:
+
+        server_config = normalize_config(item["config"])
+
+        # First comparison: server against majority.
+        peer_differences = differing_categories(
+            majority_config,
+            server_config
+        )
+
+        # Second comparison: server against approved baseline.
+        baseline_differences = (
+            compare_with_baseline(
+                server_config,
+                baseline_config
+            )
+            if baseline_config is not None
+            else []
+        )
+
+        if baseline_config is None:
+            baseline_status = "not_configured"
+        elif baseline_differences:
+            baseline_status = "deviates"
+        else:
+            baseline_status = "compliant"
+
+        comparison = {
+            "server_id": item["id"],
+            "name": item["name"],
+            "is_outlier": bool(peer_differences),
+            "differing_categories": peer_differences,
+            "baseline_differences": baseline_differences,
+            "baseline_status": baseline_status,
+        }
+
+        server_comparisons.append(comparison)
+
+        # Include servers with peer drift OR baseline deviations.
+        if peer_differences or baseline_differences:
+            outliers.append(comparison)
+
+    # --------------------------------------------------
+    # COMPARE MAJORITY AGAINST ORIGINAL BASELINE
+    # --------------------------------------------------
+
+    if baseline_config is None:
+        majority_baseline_differences = []
+        majority_baseline_status = "not_configured"
+
+    else:
+        majority_baseline_differences = compare_with_baseline(
+            majority_config,
+            baseline_config
+        )
+
+        majority_baseline_status = (
+            "deviates"
+            if majority_baseline_differences
+            else "compliant"
+        )
+
+    # --------------------------------------------------
+    # BUILD CONFIGURATION GROUPS
+    # --------------------------------------------------
+
+    clusters = []
+
+    grouped = defaultdict(list)
+
+    for item in snapshot_list:
+        grouped[canonical_config(item["config"])].append(item)
+
+    for group in grouped.values():
+        clusters.append({
+            "count": len(group),
+            "servers": [
+                {
+                    "id": item["id"],
+                    "name": item["name"],
+                }
+                for item in group
+            ],
+            "config": normalize_config(group[0]["config"]),
+        })
+
+    # --------------------------------------------------
+    # BASELINE INFORMATION
+    # --------------------------------------------------
+
+    if baseline_record is None:
+        baseline_info = {
+            "configured": False,
+            "config": None,
+            "created_at": None,
+            "updated_at": None,
+            "notes": None,
+        }
+
+    else:
+        baseline_info = {
+            "configured": True,
+            "config": baseline_config,
+            "created_at": baseline_record.created_at,
+            "updated_at": baseline_record.updated_at,
+            "notes": baseline_record.notes,
+        }
+
+    # --------------------------------------------------
+    # FINAL RESPONSE
+    # --------------------------------------------------
+
+    return {
+        "total_servers": total_servers,
+
+        "majority": majority,
+
+        "clusters": clusters,
+
         "outliers": outliers,
+
+        "server_comparisons": server_comparisons,
+
+        "baseline": baseline_info,
+
+        "majority_vs_baseline": {
+            "status": majority_baseline_status,
+            "differing_categories": majority_baseline_differences,
+        },
     }

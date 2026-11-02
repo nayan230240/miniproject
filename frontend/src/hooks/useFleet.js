@@ -1,13 +1,14 @@
-// Loads fleet + drift data and refreshes on the same 30s cadence as the backend poller.
+
+// Loads fleet + drift data and refreshes every 30 seconds.
 
 import { useCallback, useEffect, useState } from "react";
 import { getJson } from "../api.js";
 
 const REFRESH_MS = 30_000;
 
-export function useFleet() {
+function useFleet() {
   const [servers, setServers] = useState([]);
-  const [drift, setDrift] = useState(null);
+  const [drift, setDrift] = useState({});
   const [error, setError] = useState(null);
   const [updatedAt, setUpdatedAt] = useState(null);
   const [loading, setLoading] = useState(true);
@@ -18,6 +19,7 @@ export function useFleet() {
         getJson("/servers"),
         getJson("/drift"),
       ]);
+
       setServers(serverRows);
       setDrift(driftRow);
       setError(null);
@@ -31,9 +33,21 @@ export function useFleet() {
 
   useEffect(() => {
     reload();
+
     const timer = setInterval(reload, REFRESH_MS);
+
     return () => clearInterval(timer);
   }, [reload]);
 
-  return { servers, drift, error, updatedAt, loading, reload };
+  return {
+    servers,
+    drift,
+    error,
+    updatedAt,
+    loading,
+    reload,
+  };
 }
+
+export { useFleet };
+export default useFleet;
